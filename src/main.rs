@@ -6,6 +6,8 @@ pub mod configuration;
 pub mod data_loader;
 #[warn(missing_docs)]
 pub mod router;
+#[warn(missing_docs)]
+pub mod route_handler;
 
 extern crate pretty_env_logger;
 

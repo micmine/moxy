@@ -5,6 +5,7 @@ use hyper::upgrade::Upgraded;
 use hyper_tungstenite::WebSocketStream;
 use rayon::prelude::*;
 use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use tokio::time;
 
 use hyper::{
     service::{make_service_fn, service_fn},
@@ -13,31 +14,66 @@ use hyper::{
 use hyper_tungstenite::{tungstenite::Message, HyperWebsocket};
 use tokio::sync::Mutex;
 
+use crate::configuration::Route;
+use crate::route_handler;
 use crate::{
     builder::{self, storage},
-    configuration::{self, BuildMode, Configuration, RouteMethod, WsMessageType},
+    configuration::{self, BuildMode, RouteMethod, WsMessageType},
     data_loader,
 };
 
 /// Start webserver using hyper
 pub async fn start() {
-    let mut config = configuration::get_configuration().await;
-    log::trace!("Config: {:?}", config);
-    if config.host == None {
-        config.host = Some("127.0.0.1:8080".to_string());
+    let mut config_initial = configuration::get_configuration().await;
+    log::trace!("Config: {:?}", config_initial);
+    if config_initial.host == None {
+        config_initial.host = Some("127.0.0.1:8080".to_string());
     }
-    let addr: Result<SocketAddr, _> = config.host.as_ref().unwrap().parse();
+    let addr: Result<SocketAddr, _> = config_initial.host.as_ref().unwrap().parse();
 
-    let config = Arc::new(Mutex::new(config));
+    let conf = config_initial.clone();
+    let build_mode = conf.build_mode;
+    let remote = conf.remote;
+
+    let config = Arc::new(Mutex::new(config_initial.clone()));
+    let routes = Arc::new(Mutex::new(config_initial.routes));
+
+    let config_a = Arc::clone(&config);
+    let routes_a = Arc::clone(&routes);
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(10));
+
+        loop {
+            interval.tick().await;
+            let routes = routes_a.lock().await;
+            let mut config = config_a.lock().await;
+            let routes = routes.to_vec();
+
+            if config.routes != routes {
+                log::debug!("Saving: {} routes", routes.len());
+                config.routes = routes;
+
+                match configuration::save_configuration(&config).await {
+                    Ok(_) => log::info!("Saved routes"),
+                    Err(_) => log::error!("Unable to save routes"),
+                }
+            }
+        }
+    });
 
     if let Ok(addr) = addr {
         let make_service = make_service_fn(move |_| {
-            let config = config.clone();
+            let routes = Arc::clone(&routes);
+            let build_mode = build_mode.clone();
+            let remote = remote.clone();
 
             async move {
                 Ok::<_, hyper::Error>(service_fn(move |req| {
-                    let config = config.clone();
-                    async move { check_ws(req, config).await }
+                    let routes = Arc::clone(&routes);
+                    let build_mode = build_mode.clone();
+                    let remote = remote.clone();
+
+                    async move { check_ws(req, routes, build_mode, remote).await }
                 }))
             }
         });
@@ -56,15 +92,17 @@ pub async fn start() {
 
 /// Call data_loader or builder depending on if the route exists or not.
 async fn endpoint(
-    config_a: Arc<Mutex<Configuration>>,
+    routes_a: Arc<Mutex<Vec<Route>>>,
     uri: &hyper::Uri,
     method: &hyper::Method,
+    build_mode: &Option<BuildMode>,
+    remote: &Option<String>,
 ) -> Result<Response<Body>, Infallible> {
     log::info!("{}", uri);
-    let configc = config_a.clone();
-    let mut config = configc.lock().await.to_owned();
-    let (route, parameter) =
-        configuration::get_route(&config.routes, uri, &RouteMethod::from(method));
+    let routes = Arc::clone(&routes_a);
+    let mut routes = routes.lock().await.to_owned();
+    let method = RouteMethod::from(method);
+    let (route, parameter) = route_handler::get_route(&routes, uri.path(), &method);
 
     if let Some(route) = route {
         let data = data_loader::load(route, parameter);
@@ -81,21 +119,21 @@ async fn endpoint(
 
             Ok(response)
         } else {
-            if let Some(x) = config.routes.iter().position(|c| c == route) {
+            if let Some(x) = routes.iter().position(|c| c == route) {
                 log::info!("Remove route because the file does not exist: {:?}", route);
-                config.routes.remove(x);
+                routes.remove(x);
             }
 
-            if config.build_mode == Some(BuildMode::Write) {
-                builder::builder::build_response(config_a, uri, method).await
+            if build_mode == &Some(BuildMode::Write) {
+                builder::builder::build_response(uri, &method, &build_mode, &remote, routes_a).await
             } else {
                 log::error!("Will build new route for missing file");
                 let response = Response::builder().status(404).body(Body::empty()).unwrap();
                 Ok(response)
             }
         }
-    } else if config.build_mode == Some(BuildMode::Write) {
-        builder::builder::build_response(config_a, uri, method).await
+    } else if build_mode == &Some(BuildMode::Write) {
+        builder::builder::build_response(uri, &method, &build_mode, &remote, routes_a).await
     } else {
         log::info!("Resource not found and build mode disabled");
         let response = Response::builder().status(404).body(Body::empty()).unwrap();
@@ -105,7 +143,9 @@ async fn endpoint(
 
 async fn check_ws(
     request: Request<Body>,
-    config: Arc<Mutex<Configuration>>,
+    routes: Arc<Mutex<Vec<Route>>>,
+    build_mode: Option<BuildMode>,
+    remote: Option<String>,
 ) -> Result<Response<Body>, Infallible> {
     let uri = request.uri().clone();
     let method = &request.method();
@@ -113,7 +153,7 @@ async fn check_ws(
         if let Ok((response, websocket)) = hyper_tungstenite::upgrade(request, None) {
             // Spawn a task to handle the websocket connection.
             tokio::spawn(async move {
-                if let Err(e) = endpoint_ws(&uri, websocket, config).await {
+                if let Err(e) = endpoint_ws(&uri, websocket, routes, &build_mode, &remote).await {
                     log::trace!("[WS] Error in websocket connection: {}", e);
                 }
             });
@@ -126,7 +166,7 @@ async fn check_ws(
             Ok(response)
         }
     } else {
-        endpoint(config, &uri, method).await
+        endpoint(routes, &uri, method, &build_mode, &remote).await
     }
 }
 
@@ -134,12 +174,14 @@ type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 async fn endpoint_ws(
     uri: &hyper::Uri,
     websocket: HyperWebsocket,
-    config_a: Arc<Mutex<Configuration>>,
+    routes_a: Arc<Mutex<Vec<Route>>>,
+    build_mode: &Option<BuildMode>,
+    remote: &Option<String>,
 ) -> Result<(), Error> {
-    let config = config_a.clone();
-    let mut config = config.lock().await.to_owned();
+    let routes = routes_a.clone();
+    let mut routes = routes.lock().await.to_owned();
     if let (Some(route), _parameter) =
-        configuration::get_route(&config.routes, uri, &RouteMethod::WS)
+        route_handler::get_route(&routes, uri.path(), &RouteMethod::WS)
     {
         let websocket = websocket.await?;
 
@@ -191,14 +233,14 @@ async fn endpoint_ws(
 
         // execute all tasks
         while (tasks.next().await).is_some() {}
-    } else if config.build_mode == Some(BuildMode::Write) {
-        if let Some(remote) = &config.remote {
+    } else if build_mode == &Some(BuildMode::Write) {
+        if let Some(remote) = remote {
             log::trace!("Start ws build");
             let route = builder::ws::build_ws(uri, remote.to_owned(), websocket).await;
             if let Ok(route) = route {
-                config.routes.push(route);
+                routes.push(route);
             }
-            configuration::save_configuration(config.to_owned()).await?;
+            //configuration::save_configuration(config.to_owned()).await?;
         } else {
             log::info!(
                 "There is no configuration for the url: {}, and there is no remote specified",

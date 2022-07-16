@@ -7,7 +7,7 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::configuration::{self, Configuration, Route, RouteMethod, WsMessage, WsMessageType};
+use crate::{configuration::{Route, RouteMethod, WsMessage, WsMessageType}, route_handler};
 
 use super::ws::WsClientMessage;
 
@@ -17,11 +17,11 @@ pub async fn save(
     uri: &str,
     body: Vec<u8>,
     headers: &HashMap<String, String>,
-    config: Arc<Mutex<Configuration>>,
+    routes: Arc<Mutex<Vec<Route>>>,
 ) -> Result<(), std::io::Error> {
     let path = get_save_path(uri, headers);
-    let mut config = config.lock().await;
-    if config.get_route(&path, method).is_none() {
+    let mut routes = routes.lock().await;
+    if route_handler::get_route(&routes, &path, method).0.is_none() {
         let route = Route {
             method: method.clone(),
             resource: Some(path.clone()),
@@ -30,14 +30,14 @@ pub async fn save(
         };
         log::info!("Save route: {:?}", route);
 
-        config.routes.push(route);
+        routes.push(route);
 
         let folders = get_folders(&path);
 
         match check_existing_file(folders.as_str()).await {
             Ok(resource_changes) => {
                 for (from, to) in resource_changes {
-                    if let Some(route) = config.get_route_by_resource_mut(&from.to_owned(), method)
+                    if let Some(route) = route_handler::get_route_by_resource_mut(&mut routes, &from.to_owned(), method)
                     {
                         route.resource = Some(to);
                     }
@@ -46,7 +46,7 @@ pub async fn save(
             Err(e) => return Err(e),
         }
         save_file(path.as_str(), body, folders.as_str()).await?;
-        configuration::save_configuration(config.to_owned()).await?;
+        //configuration::save_configuration(config.to_owned()).await?;
     }
 
     Ok(())

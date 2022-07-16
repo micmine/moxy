@@ -9,7 +9,7 @@ use super::util::{hash_map_to_header_map, header_map_to_hash_map};
 
 /// Load data from external http source
 pub async fn fetch_http(
-    method: RouteMethod,
+    method: &RouteMethod,
     url: String,
     body: Option<String>,
     header: HashMap<String, String>,
@@ -27,7 +27,7 @@ pub async fn fetch_http(
 
     if let Ok(response) = response {
         return Some(ResourceData {
-            method,
+            method: method.clone(),
             headers: header_map_to_hash_map(response.headers()),
             code: response.status().as_u16(),
             payload: get_payload(response.bytes().await),

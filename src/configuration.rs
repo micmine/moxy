@@ -1,6 +1,6 @@
 //! This contains the configuraton datastructures and the logic how to read and wirte it.
 
-use hyper::{Method, Uri};
+use hyper::Method;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::{convert::TryInto, fmt::Display, io::ErrorKind, str::FromStr, time::Duration};
@@ -258,107 +258,9 @@ pub struct Configuration {
     pub routes: Vec<Route>,
 }
 
-impl Configuration {
-    /// Checks if there is an existing route based on the path and method
-    pub fn get_route(&self, path: &str, method: &RouteMethod) -> Option<&Route> {
-        let matching_routes = self
-            .routes
-            .iter()
-            .find(|c| c.path.as_str() == path && &c.method == method);
-
-        matching_routes
-    }
-
-    /// Checks if there is an existing route based on the resource and method
-    pub fn get_route_by_resource_mut(
-        &mut self,
-        resource: &str,
-        method: &RouteMethod,
-    ) -> Option<&mut Route> {
-        let matching_routes = self
-            .routes
-            .iter_mut()
-            .filter(|c| c.resource.is_some())
-            .find(|c| c.resource.as_ref().unwrap().as_str() == resource && &c.method == method);
-
-        matching_routes
-    }
-
-    /// Checks if there is an existing route based on the path and method
-    pub fn get_route_by_path_mut(
-        &mut self,
-        path: &str,
-        method: &RouteMethod,
-    ) -> Option<&mut Route> {
-        let matching_routes = self
-            .routes
-            .iter_mut()
-            .find(|c| c.path.as_str() == path && &c.method == method);
-
-        matching_routes
-    }
-}
-
 /// Loads the configuration from the filesystem.
 pub async fn get_configuration() -> Configuration {
     load_configuration("./moxy.json".to_string()).await
-}
-
-/// Returns the route and an optional parameter.
-///
-/// The parameter can be used to milify the configuration when there is one dynamic part of the url
-/// and file path.
-///
-/// | uri    | file       |
-/// |--------|------------|
-/// | /a.txt | ./db/a.txt |
-/// | /b.txt | ./db/b.txt |
-/// | /c.txt | ./db/c.txt |
-/// | /d.txt | ./db/d.txt |
-/// | /e.txt | ./db/e.txt |
-///
-/// In order to ceate configuration for this there would be a configuration entry for every uri.
-/// But this can be simplified.
-/// ``` json
-/// {
-///     "method": "GET",
-///     "path": "/$$$.txt",
-///     "resource": "./db/$$$.txt"
-/// }
-/// ```
-pub fn get_route<'a>(
-    routes: &'a [Route],
-    uri: &'a Uri,
-    method: &RouteMethod,
-) -> (Option<&'a Route>, Option<&'a str>) {
-    for i in routes.iter() {
-        if i.method.eq(method) {
-            let index = &i.path.find("$$$");
-            let path = &uri.path();
-
-            if let Some(index) = index {
-                let match_before = &i.path[0..*index];
-
-                if path.starts_with(&match_before) {
-                    if index + 3 != i.path.len() {
-                        let match_end = &i.path[index + 3..i.path.len()];
-
-                        if path.ends_with(match_end) {
-                            let sd = match_end.len();
-                            return (Some(i), Some(&path[i.path.len() - 3 - sd..path.len() - sd]));
-                        }
-                    } else {
-                        return (Some(i), Some(&path[i.path.len() - 3..path.len()]));
-                    }
-                }
-            }
-            if path.ends_with(&i.path) {
-                return (Some(i), None);
-            }
-        }
-    }
-
-    (None, None)
 }
 
 async fn load_configuration(loaction: String) -> Configuration {
@@ -367,23 +269,21 @@ async fn load_configuration(loaction: String) -> Configuration {
         Ok(data) => serde_json::from_str(&data).unwrap_or_else(|error| {
             log::error!("Could not load configuration file: {:?}", error);
             Configuration {
-                routes: vec![],
                 host: Some(String::from("127.0.0.1:8080")),
                 remote: Some(String::from("http://localhost")),
                 build_mode: None,
+                routes: vec![],
             }
         }),
         Err(e) => {
             let default_configuration = Configuration {
-                routes: vec![],
                 host: Some(String::from("127.0.0.1:8080")),
                 remote: Some(String::from("http://localhost")),
                 build_mode: Some(BuildMode::Write),
+                routes: vec![],
             };
             if e.kind() == ErrorKind::NotFound {
-                save_configuration(default_configuration.clone())
-                    .await
-                    .unwrap();
+                save_configuration(&default_configuration).await.unwrap();
             }
 
             default_configuration
@@ -392,8 +292,8 @@ async fn load_configuration(loaction: String) -> Configuration {
 }
 
 /// Save configuration to filesystem
-pub async fn save_configuration(configuration: Configuration) -> Result<(), std::io::Error> {
-    let config: String = serde_json::to_string_pretty(&configuration)?;
+pub async fn save_configuration(configuration: &Configuration) -> Result<(), std::io::Error> {
+    let config: String = serde_json::to_string_pretty(configuration)?;
     let mut file = File::create("./moxy.json").await?;
 
     file.write_all(config.as_bytes()).await?;
@@ -401,295 +301,4 @@ pub async fn save_configuration(configuration: Configuration) -> Result<(), std:
     file.flush().await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use hyper::Uri;
-
-    use crate::configuration::{get_route, Route, RouteMethod, WsMessageTime};
-
-    use super::Configuration;
-
-    #[test]
-    fn static_route() {
-        let routes = vec![Route {
-            method: RouteMethod::GET,
-            path: "/api/test".to_string(),
-            resource: Some("db/api/test.json".to_string()),
-            messages: vec![],
-        }];
-        let url = &"http://localhost:8080/api/test".parse::<Uri>().unwrap();
-        let (result, parameter) = get_route(&routes, &url, &RouteMethod::GET);
-
-        assert_eq!(result.unwrap().resource, routes[0].resource);
-        assert_eq!(parameter, None);
-    }
-
-    #[test]
-    fn configuration_get_route_should_find_no_route() {
-        let configuration = Configuration {
-            routes: vec![
-                Route {
-                    method: RouteMethod::GET,
-                    path: "/a".to_string(),
-                    resource: Some("somefile.txt".to_string()),
-                    messages: vec![],
-                },
-                Route {
-                    method: RouteMethod::GET,
-                    path: "/b".to_string(),
-                    resource: Some("somefile.txt".to_string()),
-                    messages: vec![],
-                },
-                Route {
-                    method: RouteMethod::GET,
-                    path: "/c".to_string(),
-                    resource: Some("somefile.txt".to_string()),
-                    messages: vec![],
-                },
-            ],
-            host: None,
-            remote: None,
-            build_mode: None,
-        };
-
-        assert!(!configuration.get_route("/abc", &RouteMethod::GET).is_some());
-    }
-
-    #[test]
-    fn configuration_get_route_should_find_route() {
-        let configuration = Configuration {
-            routes: vec![
-                Route {
-                    method: RouteMethod::GET,
-                    path: "/a".to_string(),
-                    resource: Some("somefile.txt".to_string()),
-                    messages: vec![],
-                },
-                Route {
-                    method: RouteMethod::GET,
-                    path: "/b".to_string(),
-                    resource: Some("somefile.txt".to_string()),
-                    messages: vec![],
-                },
-                Route {
-                    method: RouteMethod::GET,
-                    path: "/c".to_string(),
-                    resource: Some("somefile.txt".to_string()),
-                    messages: vec![],
-                },
-            ],
-            host: None,
-            remote: None,
-            build_mode: None,
-        };
-
-        assert!(configuration.get_route("/a", &RouteMethod::GET).is_some());
-        assert!(configuration.get_route("/b", &RouteMethod::GET).is_some());
-        assert!(configuration.get_route("/c", &RouteMethod::GET).is_some());
-    }
-
-    #[test]
-    fn dynamic_route_with_different_start() {
-        let routes = vec![
-            Route {
-                method: RouteMethod::GET,
-                path: "/api/test/1/$$$.json".to_string(),
-                resource: Some("db/api/1/$$$.json".to_string()),
-                messages: vec![],
-            },
-            Route {
-                method: RouteMethod::GET,
-                path: "/api/test/2/$$$.json".to_string(),
-                resource: Some("db/api/2/$$$.json".to_string()),
-                messages: vec![],
-            },
-            Route {
-                method: RouteMethod::GET,
-                path: "/api/test/3/$$$.json".to_string(),
-                resource: Some("db/api/3/$$$.json".to_string()),
-                messages: vec![],
-            },
-        ];
-
-        assert_eq!(
-            get_route(
-                &routes,
-                &"http://localhost:8080/api/test/1/abc.json"
-                    .parse::<Uri>()
-                    .unwrap(),
-                &RouteMethod::GET
-            )
-            .0
-            .unwrap()
-            .resource
-            .as_ref()
-            .unwrap(),
-            "db/api/1/$$$.json"
-        );
-        assert_eq!(
-            get_route(
-                &routes,
-                &"http://localhost:8080/api/test/2/abc.json"
-                    .parse::<Uri>()
-                    .unwrap(),
-                &RouteMethod::GET
-            )
-            .0
-            .unwrap()
-            .resource
-            .as_ref()
-            .unwrap(),
-            "db/api/2/$$$.json"
-        );
-        assert_eq!(
-            get_route(
-                &routes,
-                &"http://localhost:8080/api/test/3/abc.json"
-                    .parse::<Uri>()
-                    .unwrap(),
-                &RouteMethod::GET
-            )
-            .0
-            .unwrap()
-            .resource
-            .as_ref()
-            .unwrap(),
-            "db/api/3/$$$.json"
-        );
-    }
-
-    #[test]
-    fn dynamic_route_with_different_end() {
-        let routes = vec![
-            Route {
-                method: RouteMethod::GET,
-                path: "/api/test/$$$.txt".to_string(),
-                resource: Some("db/api/$$$.txt".to_string()),
-                messages: vec![],
-            },
-            Route {
-                method: RouteMethod::GET,
-                path: "/api/test/$$$.json".to_string(),
-                resource: Some("db/api/$$$.json".to_string()),
-                messages: vec![],
-            },
-        ];
-
-        assert_eq!(
-            get_route(
-                &routes,
-                &"http://localhost:8080/api/test/abc.txt"
-                    .parse::<Uri>()
-                    .unwrap(),
-                &RouteMethod::GET
-            )
-            .0
-            .unwrap()
-            .resource
-            .as_ref()
-            .unwrap(),
-            "db/api/$$$.txt"
-        );
-        assert_eq!(
-            get_route(
-                &routes,
-                &"http://localhost:8080/api/test/abc.json"
-                    .parse::<Uri>()
-                    .unwrap(),
-                &RouteMethod::GET
-            )
-            .0
-            .unwrap()
-            .resource
-            .as_ref()
-            .unwrap(),
-            "db/api/$$$.json"
-        );
-    }
-
-    #[test]
-    fn dynamic_paramerter_end() {
-        let routes = vec![Route {
-            method: RouteMethod::GET,
-            path: "/api/test/$$$".to_string(),
-            resource: Some("db/api/$$$".to_string()),
-            messages: vec![],
-        }];
-
-        assert_eq!(
-            get_route(
-                &routes,
-                &"http://localhost:8080/api/test/abc".parse::<Uri>().unwrap(),
-                &RouteMethod::GET
-            )
-            .1
-            .unwrap(),
-            "abc"
-        );
-    }
-
-    #[test]
-    fn dynamic_paramerter_middle() {
-        let routes = vec![Route {
-            method: RouteMethod::GET,
-            path: "/api/test/$$$.txt".to_string(),
-            resource: Some("db/api/$$$.txt".to_string()),
-            messages: vec![],
-        }];
-
-        assert_eq!(
-            get_route(
-                &routes,
-                &"http://localhost:8080/api/test/abc.txt"
-                    .parse::<Uri>()
-                    .unwrap(),
-                &RouteMethod::GET
-            )
-            .1
-            .unwrap(),
-            "abc"
-        );
-    }
-
-    #[test]
-    fn parse_ws_message_time() {
-        assert_eq!(
-            "3s".parse::<WsMessageTime>().unwrap(),
-            WsMessageTime::Second(3)
-        );
-        assert_eq!(
-            "3m".parse::<WsMessageTime>().unwrap(),
-            WsMessageTime::Minute(3)
-        );
-        assert_eq!(
-            "3h".parse::<WsMessageTime>().unwrap(),
-            WsMessageTime::Hour(3)
-        );
-        assert_eq!(
-            "3sent".parse::<WsMessageTime>().unwrap(),
-            WsMessageTime::Sent(3)
-        );
-        assert_eq!(
-            "3recived".parse::<WsMessageTime>().unwrap(),
-            WsMessageTime::Recived(3)
-        );
-    }
-
-    #[test]
-    fn get_route_should_not_find_entry_if_the_url_only_partialy_matches() {
-        let routes = [Route {
-            method: RouteMethod::GET,
-            path: "/a".to_string(),
-            resource: Some("".to_string()),
-            messages: vec![],
-        }];
-
-        let uri = Uri::from_static("/a/test");
-
-        let result = get_route(&routes, &uri, &RouteMethod::GET);
-
-        assert_eq!(result, (None, None));
-    }
 }

@@ -3,7 +3,7 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use hyper::{Body, Response};
 use tokio::sync::Mutex;
 
-use crate::configuration::{BuildMode, Configuration, RouteMethod};
+use crate::configuration::{BuildMode, Route, RouteMethod};
 
 use super::{request, storage};
 
@@ -24,17 +24,17 @@ pub struct ResourceData {
 /// into a file. It also modifies the configuration in order to not call this function with the
 /// same URL again.
 pub async fn build_response(
-    config_a: Arc<Mutex<Configuration>>,
     uri: &hyper::Uri,
-    method: &hyper::Method,
+    method: &RouteMethod,
+    build_mode: &Option<BuildMode>,
+    remote: &Option<String>,
+    routes_a: Arc<Mutex<Vec<Route>>>,
 ) -> Result<Response<Body>, Infallible> {
-    let config_b = config_a.clone();
-    let config = config_b.lock().await.to_owned();
-    if let Some(build_mode) = &config.build_mode {
-        if let Some(remote) = &config.remote {
+    if let Some(build_mode) = build_mode {
+        if let Some(remote) = remote {
             let response = request::http::fetch_http(
-                RouteMethod::from(method),
-                request::util::get_url(uri, remote),
+                &method,
+                request::util::get_url(uri, &remote),
                 None,
                 HashMap::new(),
             )
@@ -43,13 +43,13 @@ pub async fn build_response(
             match response {
                 Some(response) => {
                     if let Some(body) = response.payload {
-                        if response.code != 404 && build_mode == &BuildMode::Write {
+                            if response.code != 404 && build_mode == &BuildMode::Write {
                             storage::save(
                                 &response.method,
                                 uri.path(),
                                 body.clone(),
                                 &response.headers,
-                                config_a,
+                                routes_a,
                             )
                             .await
                             .unwrap()
